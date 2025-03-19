@@ -153,11 +153,12 @@ function getUserName(msg: any) {
 }
 export default {
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-		console.debug('Scheduled task starting:', new Date().toISOString());
+		console.log('开始执行定时任务:', new Date().toISOString());
 		const date = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
 
 		// 清理旧消息
 		if (date.getHours() === 0 && date.getMinutes() < 5) {
+			console.log('开始清理旧消息');
 			await env.DB.prepare(
 				`
           DELETE FROM Messages
@@ -175,17 +176,19 @@ export default {
             WHERE row_num > 3000
           );`
 			).run();
+			console.log('旧消息清理完成');
 		}
 
 		// 获取要处理的单一 groupId (从环境变量或硬编码)
-		const groupId = env.GROUP_ID; // 假设您在环境变量中设置了 TARGET_GROUP_ID
+		const groupId = env.GROUP_ID;
+		console.log('目标群组ID:', groupId);
 
 		if (!groupId) {
-			console.error('Target group ID is not set.');
+			console.error('未设置目标群组ID');
 			return;
 		}
 
-		console.debug(`Processing group: ${groupId}`);
+		console.log('开始处理群组:', groupId);
 
 		// 查询特定 groupId 的消息
 		const { results } = await env.DB.prepare(
@@ -197,14 +200,12 @@ export default {
     ORDER BY timeStamp ASC
 `
 		)
-			.bind(
-				groupId,
-				Date.now() - 24 * 60 * 60 * 1000,
-				env.TOPIC_ID || null // 使用环境变量中的默认 topic
-			)
+			.bind(groupId, Date.now() - 24 * 60 * 60 * 1000, env.TOPIC_ID || null)
 			.all();
+		console.log('查询到消息数量:', results.length);
 
 		// 生成摘要
+		console.log('开始生成摘要');
 		const result = await getGenModel(env).generateContent([
 			`用符合风格的语气概括下面的对话, 对话格式为
 ====================
@@ -220,9 +221,10 @@ export default {
 			`概括的开头是: 本日群聊总结如下：`,
 			...results.flatMap((r: any) => [`====================`, `${r.userName}:`, dispatchContent(r.content), getMessageLink(r)]),
 		]);
+		console.log('摘要生成完成');
 
 		// 发送摘要到 Telegram 群组
-		console.debug('send message to', groupId);
+		console.log('准备发送摘要到群组:', groupId);
 		await fetch(`https://api.telegram.org/bot${env.SECRET_TELEGRAM_API_TOKEN}/sendMessage`, {
 			method: 'POST',
 			headers: {
@@ -230,14 +232,16 @@ export default {
 			},
 			body: JSON.stringify({
 				chat_id: groupId,
-				message_thread_id: env.TOPIC_ID || undefined, // 添加 topic_id
+				message_thread_id: env.TOPIC_ID || undefined,
 				text: processMarkdownLinks(telegramifyMarkdown(messageTemplate(result.response.text()), 'keep')),
 				parse_mode: 'MarkdownV2',
 			}),
 		});
+		console.log('摘要发送完成');
 
 		// 清理旧图片
 		if (date.getHours() === 0 && date.getMinutes() < 5) {
+			console.log('开始清理旧图片');
 			ctx.waitUntil(
 				env.DB.prepare(
 					`
@@ -248,29 +252,35 @@ export default {
 					.bind(Date.now() - 24 * 60 * 60 * 1000)
 					.run()
 			);
+			console.log('旧图片清理完成');
 		}
 
-		console.debug('cron processed');
+		console.log('定时任务处理完成');
 	},
 	fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
+		console.log('收到新的请求');
 		await new TelegramBot(env.SECRET_TELEGRAM_API_TOKEN)
 			.on('status', async (ctx) => {
+				console.log('收到状态请求');
 				const res = (await ctx.reply('我家还蛮大的'))!;
 				if (!res.ok) {
-					console.error(`Error sending message:`, res);
+					console.error(`发送消息失败:`, res);
 				}
 				return new Response('ok');
 			})
 			.on('query', async (ctx) => {
+				console.log('收到查询请求');
 				const groupId = ctx.update.message!.chat.id;
 				const messageText = ctx.update.message!.text || '';
 				if (!messageText.split(' ')[1]) {
+					console.log('查询关键词为空');
 					const res = (await ctx.reply('请输入要查询的关键词'))!;
 					if (!res.ok) {
-						console.error(`Error sending message:`, res);
+						console.error(`发送消息失败:`, res);
 					}
 					return new Response('ok');
 				}
+				console.log('开始查询关键词:', messageText.split(' ')[1]);
 				const { results } = await env.DB.prepare(
 					`
 					SELECT * FROM Messages
@@ -280,6 +290,7 @@ export default {
 				)
 					.bind(groupId, `*${messageText.split(' ')[1]}*`)
 					.all();
+				console.log('查询到结果数量:', results.length);
 				const res = (await ctx.reply(
 					`查询结果:
 ${results
@@ -291,188 +302,24 @@ ${results
 					'MarkdownV2'
 				))!;
 				if (!res.ok) {
-					console.error(`Error sending message:`, res);
+					console.error(`发送消息失败:`, res);
 				}
-				return new Response('ok');
-			})
-			// 			.on('ask', async (ctx) => {
-			// 				const groupId = ctx.update.message!.chat.id;
-			// 				const userId = ctx.update.message!.from!.id;
-			// 				const messageText = ctx.update.message!.text || '';
-			// 				if (!messageText.split(' ')[1]) {
-			// 					const res = (await ctx.reply('请输入要问的问题'))!;
-			// 					if (!res.ok) {
-			// 						console.error(`Error sending message:`, res);
-			// 					}
-			// 					return new Response('ok');
-			// 				}
-			// 				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-			// 					chat_id: userId,
-			// 					parse_mode: 'MarkdownV2',
-			// 					text: 'bot 已经收到你的问题, 请稍等',
-			// 					reply_to_message_id: -1,
-			// 				});
-			// 				if (!res.ok) {
-			// 					await ctx.reply(`请开启和 bot 的私聊, 不然无法接收消息`);
-			// 					return new Response('ok');
-			// 				}
-			// 				const { results } = await env.DB.prepare(
-			// 					`
-			// 					WITH latest_1000 AS (
-			// 						SELECT * FROM Messages
-			// 						WHERE groupId=?
-			// 						ORDER BY timeStamp DESC
-			// 						LIMIT 1000
-			// 					)
-			// 					SELECT * FROM latest_1000
-			// 					ORDER BY timeStamp ASC
-			// 					`
-			// 				)
-			// 					.bind(groupId)
-			// 					.all();
-			// 				let result;
-			// 				try {
-			// 					result = await getGenModel(env).generateContent(
-			// 						[
-			// 							`下面是一系列的对话, 格式是
-			// ====================
-			// 用户名:
-			// 发言内容
-			// 相应链接
-			// ====================
-			// `,
-			// 							...results.flatMap((r: any) => [
-			// 								`====================`,
-			// 								`${r.userName as string}: `,
-			// 								dispatchContent(r.content as string),
-			// 								getSendTime(r),
-			// 								getMessageLink(r),
-			// 							]),
-			// 							`基于上面的记录, 用符合上文风格的语气回答这个问题, 并在回答的关键词中用 markdown 的格式引用原对话的链接, 格式为
-			// [引用1](链接本体)
-			// [引用2](链接本体)
-			// [关键字1](链接本体)
-			// [关键字2](链接本体), 在链接的两侧加空格`,
-			// 							getCommandVar(messageText, ' '),
-			// 						],
-			// 						{ timeout: 99999999999 }
-			// 					);
-			// 				} catch (e) {
-			// 					console.error(e);
-			// 					return new Response('ok');
-			// 				}
-			// 				let response_text: string;
-			// 				if (result.response.promptFeedback?.blockReason) {
-			// 					response_text = '无法回答, 理由' + result.response.promptFeedback.blockReason;
-			// 				} else {
-			// 					response_text = processMarkdownLinks(telegramifyMarkdown(result.response.text(), 'keep'));
-			// 				}
-			// 				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-			// 					chat_id: userId,
-			// 					parse_mode: 'MarkdownV2',
-			// 					text: response_text,
-			// 					reply_to_message_id: -1,
-			// 				});
-			// 				if (!res.ok) {
-			// 					let reason = ((await res.json()) as any)?.promptFeedback?.blockReason;
-			// 					if (reason) {
-			// 						await ctx.reply(`无法回答, 理由 ${reason}`);
-			// 						return new Response('ok');
-			// 					}
-			// 					await ctx.reply(`发送失败`);
-			// 				}
-			// 				return new Response('ok');
-			// 			})
-			.on('summary', async (bot) => {
-				const groupId = bot.update.message!.chat.id;
-				if (bot.update.message!.text!.split(' ').length === 1) {
-					await bot.reply('请输入要查询的时间范围/消息数量, 如 /summary 114h 或 /summary 514');
-					return new Response('ok');
-				}
-				const summary = bot.update.message!.text!.split(' ')[1];
-				let results: Record<string, unknown>[];
-				try {
-					const test = parseInt(summary);
-					if (Number.isNaN(test)) {
-						throw new Error('not a number');
-					}
-					if (test < 0) {
-						throw new Error('negative number');
-					}
-					if (!Number.isFinite(test)) {
-						throw new Error('infinite number');
-					}
-				} catch (e: any) {
-					await bot.reply('请输入要查询的时间范围/消息数量, 如 /summary 114h 或 /summary 514  ' + e.message);
-					return new Response('ok');
-				}
-				if (summary.endsWith('h')) {
-					results = (
-						await env.DB.prepare(
-							`
-						SELECT *
-						FROM Messages
-						WHERE groupId=? AND timeStamp >= ?
-						ORDER BY timeStamp ASC
-						`
-						)
-							.bind(groupId, Date.now() - parseInt(summary) * 60 * 60 * 1000)
-							.all()
-					).results;
-				} else {
-					results = (
-						await env.DB.prepare(
-							`
-						WITH latest_n AS (
-							SELECT * FROM Messages
-							WHERE groupId=?
-							ORDER BY timeStamp DESC
-							LIMIT ?
-						)
-						SELECT * FROM latest_n
-						ORDER BY timeStamp ASC
-						`
-						)
-							.bind(groupId, Math.min(parseInt(summary), 4000))
-							.all()
-					).results;
-				}
-				if (results.length > 0) {
-					try {
-						const result = await getGenModel(env).generateContent([
-							`用符合风格的语气概括下面的对话, 对话格式为
-====================
-用户名:
-发言内容
-相应链接
-====================
-如果对话里出现了多个主题, 请分条概括, 涉及到的图片也要提到相关内容, 并在回答的关键词中用 markdown 的格式引用原对话的链接, 格式为
-[引用1](链接本体)
-[引用2](链接本体)
-[关键字1](链接本体)
-[关键字2](链接本体)`,
-							`群聊总结如下:`,
-							...results.flatMap((r: any) => ['====================', `${r.userName}:`, dispatchContent(r.content), getMessageLink(r)]),
-						]);
-						await bot.reply(processMarkdownLinks(telegramifyMarkdown(result.response.text(), 'keep')), 'MarkdownV2');
-					} catch (e) {
-						console.error(e);
-					}
-				}
-
 				return new Response('ok');
 			})
 			.on(':message', async (bot) => {
+				console.log('收到新消息');
 				if (!bot.update.message!.chat.type.includes('group')) {
+					console.log('消息不是来自群组');
 					await bot.reply('I am a bot, please add me to a group to use me.');
 					return new Response('ok');
 				}
 
 				switch (bot.update_type) {
 					case 'message': {
+						console.log('处理文本消息');
 						const msg = bot.update.message!;
 						const groupId = msg.chat.id;
-						const topicId = msg.reply_to_message?.message_id || null; // 获取 topic id
+						const topicId = msg.reply_to_message?.message_id || null;
 						let content = msg.text || '';
 						const fwd = msg.forward_from?.last_name;
 						const replyTo = msg.reply_to_message?.message_id;
@@ -483,12 +330,21 @@ ${results
 							content = `回复 ${getMessageLink({ groupId: groupId.toString(), messageId: replyTo, topicId })}: ${content}`;
 						}
 						if (content.startsWith('http') && !content.includes(' ')) {
+							console.log('处理URL消息');
 							content = await extractAllOGInfo(content);
 						}
 						const messageId = msg.message_id;
 						const groupName = msg.chat.title || 'anonymous';
 						const timeStamp = Date.now();
 						const userName = getUserName(msg);
+						console.log('准备保存消息到数据库:', {
+							groupId,
+							messageId,
+							topicId,
+							userName,
+							groupName,
+							content,
+						});
 						try {
 							await env.DB.prepare(
 								`
@@ -498,32 +354,36 @@ ${results
 									getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
 									groupId,
 									timeStamp,
-									userName, // not interested in user id
+									userName,
 									content,
 									messageId,
 									groupName,
 									topicId
 								)
 								.run();
+							console.log('消息保存成功');
 						} catch (e) {
-							console.error(e);
+							console.error('消息保存失败:', e);
 						}
 						return new Response('ok');
 					}
 					case 'photo': {
+						console.log('处理图片消息');
 						const msg = bot.update.message!;
 						const groupId = msg.chat.id;
 						const messageId = msg.message_id;
 						const groupName = msg.chat.title || 'anonymous';
-						const topicId = msg.reply_to_message?.message_id || null; // 获取 topic id
+						const topicId = msg.reply_to_message?.message_id || null;
 						const timeStamp = Date.now();
 						const userName = getUserName(msg);
 						const photo = msg.photo![msg.photo!.length - 1];
+						console.log('开始获取图片文件');
 						const file = await bot.getFile(photo.file_id).then((response) => response.arrayBuffer());
 						if (!isJPEGBase64(Buffer.from(file).toString('base64')).isValid) {
-							console.error('not a jpeg');
+							console.error('不是有效的JPEG图片');
 							return new Response('ok');
 						}
+						console.log('准备保存图片到数据库');
 						try {
 							await env.DB.prepare(
 								`
@@ -533,15 +393,16 @@ ${results
 									getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
 									groupId,
 									timeStamp,
-									userName, // not interested in user id
+									userName,
 									'data:image/jpeg;base64,' + Buffer.from(file).toString('base64'),
 									messageId,
 									groupName,
 									topicId
 								)
 								.run();
+							console.log('图片保存成功');
 						} catch (e) {
-							console.error(e);
+							console.error('图片保存失败:', e);
 						}
 						return new Response('ok');
 					}
@@ -549,14 +410,16 @@ ${results
 				return new Response('ok');
 			})
 			.on(':edited_message', async (ctx) => {
+				console.log('处理编辑消息');
 				const msg = ctx.update.edited_message!;
 				const groupId = msg.chat.id;
 				const content = msg.text || '';
 				const messageId = msg.message_id;
 				const groupName = msg.chat.title || 'anonymous';
-				const topicId = msg.reply_to_message?.message_id || null; // 获取 topic id
+				const topicId = msg.reply_to_message?.message_id || null;
 				const timeStamp = Date.now();
 				const userName = getUserName(msg);
+				console.log('准备更新编辑的消息');
 				try {
 					await env.DB.prepare(
 						`
@@ -566,15 +429,16 @@ ${results
 							getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
 							groupId,
 							timeStamp,
-							userName, // not interested in user id
+							userName,
 							content,
 							messageId,
 							groupName,
 							topicId
 						)
 						.run();
+					console.log('编辑消息更新成功');
 				} catch (e) {
-					console.error(e);
+					console.error('编辑消息更新失败:', e);
 				}
 				return new Response('ok');
 			})
