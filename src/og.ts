@@ -8,18 +8,18 @@ export async function extractAllOGInfo(url: string): Promise<string> {
 
 		class MetaHandler {
 			element(element: Element) {
-				const propertyValue = element.getAttribute("property");
+				const propertyValue = element.getAttribute('property');
 				// og
-				if (propertyValue?.startsWith("og:")) {
-					const contentValue = element.getAttribute("content");
+				if (propertyValue?.startsWith('og:')) {
+					const contentValue = element.getAttribute('content');
 					if (contentValue) {
-						ogData.set(propertyValue.replace("og:", ""), contentValue);
+						ogData.set(propertyValue.replace('og:', ''), contentValue);
 					}
 					element.remove();
 				}
 				// youtube
-				const name = element.getAttribute("name");
-				const contentValue = element.getAttribute("content");
+				const name = element.getAttribute('name');
+				const contentValue = element.getAttribute('content');
 
 				if (name && contentValue) {
 					ogData.set(name, contentValue);
@@ -29,16 +29,15 @@ export async function extractAllOGInfo(url: string): Promise<string> {
 		}
 		const rewriter = new HTMLRewriter().on('meta', new MetaHandler());
 		await rewriter.transform(response).text(); // 使用 await 处理 Promise
-		if(ogData.size === 0) {
+		if (ogData.size === 0) {
 			return url;
 		}
-		let ret = "";
+		let ret = '';
 		for (const [key, value] of ogData.entries()) {
 			ret += `${key}: ${value}\n`;
 		}
 		return `${url} 的相关信息为:\n` + ret;
-	}
-	catch (error) {
+	} catch (error) {
 		return url;
 	}
 }
