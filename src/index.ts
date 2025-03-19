@@ -1,4 +1,4 @@
-import TelegramBot, { TelegramApi } from '@codebam/cf-workers-telegram-bot';
+import { Bot, webhookCallback } from 'grammy';
 import { GenerationConfig, GoogleGenerativeAI, HarmBlockThreshold, HarmCategory, SchemaType } from '@google/generative-ai';
 import telegramifyMarkdown from 'telegramify-markdown';
 //@ts-ignore
@@ -259,39 +259,44 @@ export default {
 	},
 	fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
 		console.log('收到新的请求');
-		await new TelegramBot(env.SECRET_TELEGRAM_API_TOKEN)
-			.on('status', async (ctx) => {
-				console.log('收到状态请求');
-				const res = (await ctx.reply('我家还蛮大的'))!;
-				if (!res.ok) {
-					console.error(`发送消息失败:`, res);
+		const bot = new Bot(env.SECRET_TELEGRAM_API_TOKEN);
+
+		// 状态命令
+		bot.command('status', async (ctx) => {
+			console.log('收到状态请求');
+			try {
+				await ctx.reply('我家还蛮大的');
+			} catch (e) {
+				console.error('发送消息失败:', e);
+			}
+		});
+
+		// 查询命令
+		bot.command('query', async (ctx) => {
+			console.log('收到查询请求');
+			const messageText = ctx.message?.text || '';
+			if (!messageText.split(' ')[1]) {
+				console.log('查询关键词为空');
+				try {
+					await ctx.reply('请输入要查询的关键词');
+				} catch (e) {
+					console.error('发送消息失败:', e);
 				}
-				return new Response('ok');
-			})
-			.on('query', async (ctx) => {
-				console.log('收到查询请求');
-				const groupId = ctx.update.message!.chat.id;
-				const messageText = ctx.update.message!.text || '';
-				if (!messageText.split(' ')[1]) {
-					console.log('查询关键词为空');
-					const res = (await ctx.reply('请输入要查询的关键词'))!;
-					if (!res.ok) {
-						console.error(`发送消息失败:`, res);
-					}
-					return new Response('ok');
-				}
-				console.log('开始查询关键词:', messageText.split(' ')[1]);
-				const { results } = await env.DB.prepare(
-					`
-					SELECT * FROM Messages
-					WHERE groupId=? AND content GLOB ?
-					ORDER BY timeStamp DESC
-					LIMIT 2000`
-				)
-					.bind(groupId, `*${messageText.split(' ')[1]}*`)
-					.all();
-				console.log('查询到结果数量:', results.length);
-				const res = (await ctx.reply(
+				return;
+			}
+			console.log('开始查询关键词:', messageText.split(' ')[1]);
+			const { results } = await env.DB.prepare(
+				`
+				SELECT * FROM Messages
+				WHERE groupId=? AND content GLOB ?
+				ORDER BY timeStamp DESC
+				LIMIT 2000`
+			)
+				.bind(ctx.chat.id, `*${messageText.split(' ')[1]}*`)
+				.all();
+			console.log('查询到结果数量:', results.length);
+			try {
+				await ctx.reply(
 					`查询结果:
 ${results
 	.map(
@@ -299,150 +304,152 @@ ${results
 			`${r.userName}: ${r.content} ${r.messageId == null ? '' : `[link](https://t.me/c/${parseInt(r.groupId.slice(2))}/${r.messageId})`}`
 	)
 	.join('\n')}`,
-					'MarkdownV2'
-				))!;
-				if (!res.ok) {
-					console.error(`发送消息失败:`, res);
-				}
-				return new Response('ok');
-			})
-			.on(':message', async (bot) => {
-				console.log('收到新消息');
-				if (!bot.update.message!.chat.type.includes('group')) {
-					console.log('消息不是来自群组');
-					await bot.reply('I am a bot, please add me to a group to use me.');
-					return new Response('ok');
-				}
+					{ parse_mode: 'MarkdownV2' }
+				);
+			} catch (e) {
+				console.error('发送消息失败:', e);
+			}
+		});
 
-				switch (bot.update_type) {
-					case 'message': {
-						console.log('处理文本消息');
-						const msg = bot.update.message!;
-						const groupId = msg.chat.id;
-						const topicId = msg.reply_to_message?.message_id || null;
-						let content = msg.text || '';
-						const fwd = msg.forward_from?.last_name;
-						const replyTo = msg.reply_to_message?.message_id;
-						if (fwd) {
-							content = `转发自 ${fwd}: ${content}`;
-						}
-						if (replyTo) {
-							content = `回复 ${getMessageLink({ groupId: groupId.toString(), messageId: replyTo, topicId })}: ${content}`;
-						}
-						if (content.startsWith('http') && !content.includes(' ')) {
-							console.log('处理URL消息');
-							content = await extractAllOGInfo(content);
-						}
-						const messageId = msg.message_id;
-						const groupName = msg.chat.title || 'anonymous';
-						const timeStamp = Date.now();
-						const userName = getUserName(msg);
-						console.log('准备保存消息到数据库:', {
-							groupId,
-							messageId,
-							topicId,
-							userName,
-							groupName,
-							content,
-						});
-						try {
-							await env.DB.prepare(
-								`
-								INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-							)
-								.bind(
-									getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
-									groupId,
-									timeStamp,
-									userName,
-									content,
-									messageId,
-									groupName,
-									topicId
-								)
-								.run();
-							console.log('消息保存成功');
-						} catch (e) {
-							console.error('消息保存失败:', e);
-						}
-						return new Response('ok');
-					}
-					case 'photo': {
-						console.log('处理图片消息');
-						const msg = bot.update.message!;
-						const groupId = msg.chat.id;
-						const messageId = msg.message_id;
-						const groupName = msg.chat.title || 'anonymous';
-						const topicId = msg.reply_to_message?.message_id || null;
-						const timeStamp = Date.now();
-						const userName = getUserName(msg);
-						const photo = msg.photo![msg.photo!.length - 1];
-						console.log('开始获取图片文件');
-						const file = await bot.getFile(photo.file_id).then((response) => response.arrayBuffer());
-						if (!isJPEGBase64(Buffer.from(file).toString('base64')).isValid) {
-							console.error('不是有效的JPEG图片');
-							return new Response('ok');
-						}
-						console.log('准备保存图片到数据库');
-						try {
-							await env.DB.prepare(
-								`
-							INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-							)
-								.bind(
-									getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
-									groupId,
-									timeStamp,
-									userName,
-									'data:image/jpeg;base64,' + Buffer.from(file).toString('base64'),
-									messageId,
-									groupName,
-									topicId
-								)
-								.run();
-							console.log('图片保存成功');
-						} catch (e) {
-							console.error('图片保存失败:', e);
-						}
-						return new Response('ok');
-					}
-				}
-				return new Response('ok');
-			})
-			.on(':edited_message', async (ctx) => {
-				console.log('处理编辑消息');
-				const msg = ctx.update.edited_message!;
-				const groupId = msg.chat.id;
-				const content = msg.text || '';
-				const messageId = msg.message_id;
-				const groupName = msg.chat.title || 'anonymous';
-				const topicId = msg.reply_to_message?.message_id || null;
-				const timeStamp = Date.now();
-				const userName = getUserName(msg);
-				console.log('准备更新编辑的消息');
-				try {
-					await env.DB.prepare(
-						`
-					INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		// 处理文本消息
+		bot.on('message:text', async (ctx) => {
+			console.log('收到新消息');
+			if (!ctx.chat.type.includes('group')) {
+				console.log('消息不是来自群组');
+				await ctx.reply('I am a bot, please add me to a group to use me.');
+				return;
+			}
+
+			const msg = ctx.message;
+			const groupId = msg.chat.id;
+			const topicId = msg.message_thread_id || null;
+			let content = msg.text || '';
+
+			// const fwd = msg.forward_origin?.type;
+			// if (fwd) {
+			// 	content = `转发自 ${fwd}: ${content}`;
+			// }
+
+			const replyTo = msg.reply_to_message?.message_id;
+			if (replyTo) {
+				content = `回复 ${getMessageLink({ groupId: groupId.toString(), messageId: replyTo, topicId })}: ${content}`;
+			}
+			if (content.startsWith('http') && !content.includes(' ')) {
+				console.log('处理URL消息');
+				content = await extractAllOGInfo(content);
+			}
+			const messageId = msg.message_id;
+			const groupName = msg.chat.title || 'anonymous';
+			const timeStamp = Date.now();
+			const userName = getUserName(msg);
+			console.log('准备保存消息到数据库:', {
+				groupId,
+				messageId,
+				topicId,
+				userName,
+				groupName,
+				content,
+			});
+			try {
+				await env.DB.prepare(
+					`
+					INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+				)
+					.bind(
+						getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
+						groupId,
+						timeStamp,
+						userName,
+						content,
+						messageId,
+						groupName,
+						topicId
 					)
-						.bind(
-							getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
-							groupId,
-							timeStamp,
-							userName,
-							content,
-							messageId,
-							groupName,
-							topicId
-						)
-						.run();
-					console.log('编辑消息更新成功');
-				} catch (e) {
-					console.error('编辑消息更新失败:', e);
-				}
-				return new Response('ok');
-			})
-			.handle(request.clone());
-		return new Response('ok');
+					.run();
+				console.log('消息保存成功');
+			} catch (e) {
+				console.error('消息保存失败:', e);
+			}
+		});
+
+		// 处理图片消息
+		bot.on('message:photo', async (ctx) => {
+			console.log('处理图片消息');
+			const msg = ctx.message;
+			const groupId = msg.chat.id;
+			const messageId = msg.message_id;
+			const groupName = msg.chat.title || 'anonymous';
+			const topicId = msg.message_thread_id || null;
+			const timeStamp = Date.now();
+			const userName = getUserName(msg);
+			const photo = msg.photo![msg.photo!.length - 1];
+			console.log('开始获取图片文件');
+			const file = await ctx.api.getFile(photo.file_id).then(async (response) => {
+				const fileUrl = `https://api.telegram.org/file/bot${env.SECRET_TELEGRAM_API_TOKEN}/${response.file_path}`;
+				const fileResponse = await fetch(fileUrl);
+				return fileResponse.arrayBuffer();
+			});
+			if (!isJPEGBase64(Buffer.from(file).toString('base64')).isValid) {
+				console.error('不是有效的JPEG图片');
+				return;
+			}
+			console.log('准备保存图片到数据库');
+			try {
+				await env.DB.prepare(
+					`
+				INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+				)
+					.bind(
+						getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
+						groupId,
+						timeStamp,
+						userName,
+						'data:image/jpeg;base64,' + Buffer.from(file).toString('base64'),
+						messageId,
+						groupName,
+						topicId
+					)
+					.run();
+				console.log('图片保存成功');
+			} catch (e) {
+				console.error('图片保存失败:', e);
+			}
+		});
+
+		// 处理编辑消息
+		bot.on('edited_message:text', async (ctx) => {
+			console.log('处理编辑消息');
+			const msg = ctx.editedMessage;
+			const groupId = msg.chat.id;
+			const content = msg.text || '';
+			const messageId = msg.message_id;
+			const groupName = msg.chat.title || 'anonymous';
+			const topicId = msg.message_thread_id || null;
+			const timeStamp = Date.now();
+			const userName = getUserName(msg);
+			console.log('准备更新编辑的消息');
+			try {
+				await env.DB.prepare(
+					`
+				INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+				)
+					.bind(
+						getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
+						groupId,
+						timeStamp,
+						userName,
+						content,
+						messageId,
+						groupName,
+						topicId
+					)
+					.run();
+				console.log('编辑消息更新成功');
+			} catch (e) {
+				console.error('编辑消息更新失败:', e);
+			}
+		});
+
+		return webhookCallback(bot, 'cloudflare-mod')(request);
 	},
 };
