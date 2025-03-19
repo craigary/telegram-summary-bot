@@ -17,8 +17,10 @@ function dispatchContent(content: string) {
 	return content;
 }
 
-function getMessageLink(r: { groupId: string; messageId: number }) {
-	return `https://t.me/c/${parseInt(r.groupId.slice(2))}/${r.messageId}`;
+function getMessageLink(r: { groupId: string; messageId: number; topicId?: number | null }): string {
+	return r.topicId
+		? `https://t.me/c/${parseInt(r.groupId.slice(2))}/${r.topicId}/${r.messageId}`
+		: `https://t.me/c/${parseInt(r.groupId.slice(2))}/${r.messageId}`;
 }
 
 function getSendTime(r: R) {
@@ -30,7 +32,7 @@ function getSendTime(r: R) {
  * @param {number} num - 要转换的数字
  * @returns {string} 上标形式的数字
  */
-export function toSuperscript(num: number) {
+export function toSuperscript(num: number): string {
 	const superscripts = {
 		'0': '⁰',
 		'1': '¹',
@@ -64,7 +66,7 @@ export function processMarkdownLinks(
 		prefix: '引用',
 		useEnglish: false,
 	}
-) {
+): string {
 	const { prefix, useEnglish } = options;
 
 	// 用于存储已经出现过的链接
@@ -103,7 +105,7 @@ type R = {
 };
 
 function getGenModel(env: Env) {
-	const model = 'gemini-2.0-flash';
+	const model = 'gemini-2.0-flash-exp';
 	const gateway_name = 'telegram-summary-bot';
 	const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 	const account_id = env.account_id;
@@ -153,82 +155,58 @@ export default {
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
 		console.debug('Scheduled task starting:', new Date().toISOString());
 		const date = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
-		// Clean up oldest 4000 messages
+
+		// 清理旧消息
 		if (date.getHours() === 0 && date.getMinutes() < 5) {
 			await env.DB.prepare(
 				`
-					DELETE FROM Messages
-					WHERE id IN (
-						SELECT id
-						FROM (
-							SELECT
-								id,
-								ROW_NUMBER() OVER (
-									PARTITION BY groupId
-									ORDER BY timeStamp DESC
-								) as row_num
-							FROM Messages
-						) ranked
-						WHERE row_num > 3000
-					);`
+          DELETE FROM Messages
+          WHERE id IN (
+            SELECT id
+            FROM (
+              SELECT
+                id,
+                ROW_NUMBER() OVER (
+                  PARTITION BY groupId
+                  ORDER BY timeStamp DESC
+                ) as row_num
+              FROM Messages
+            ) ranked
+            WHERE row_num > 3000
+          );`
 			).run();
 		}
-		const cache = caches.default;
-		const cacheKey = new Request(`https://dummy-url/${env.SECRET_TELEGRAM_API_TOKEN}`);
-		const cachedResponse = await cache.match(cacheKey);
-		let groups: any[] = [];
-		if (cachedResponse) {
-			console.debug('Using cached response');
-			groups = await cachedResponse.json();
-		} else {
-			console.debug('Fetching groups');
-			groups = (
-				await env.DB.prepare(
-					`
-		WITH MessageCounts AS (
-			SELECT
-				groupId,
-				COUNT(*) as message_count
-			FROM Messages
-			WHERE timeStamp >= ?1 - (24 * 3600 * 1000)
-			GROUP BY groupId
-		)
-		SELECT groupId, message_count
-		FROM MessageCounts
-		WHERE message_count > 10
-		ORDER BY message_count DESC;
-		`
-				)
-					.bind(Date.now())
-					.all()
-			).results;
-			ctx.waitUntil(
-				cache.put(
-					cacheKey,
-					new Response(JSON.stringify(groups), {
-						headers: {
-							'content-type': 'application/json',
-							'Cache-Control': 's-maxage=10000', // > 7200 < 86400
-						},
-					})
-				)
-			);
+
+		// 获取要处理的单一 groupId (从环境变量或硬编码)
+		const groupId = env.GROUP_ID; // 假设您在环境变量中设置了 TARGET_GROUP_ID
+
+		if (!groupId) {
+			console.error('Target group ID is not set.');
+			return;
 		}
-		const batch = Math.floor(date.getMinutes() / 6); // 0 <= batch < 10
 
-		console.debug('Batch:', batch);
-		console.debug('Found groups:', groups.length, JSON.stringify(groups));
-		for (const [id, group] of groups.entries()) {
-			if (id % 10 !== batch) {
-				continue;
-			}
-			console.debug(`Processing group ${id + 1}/${groups.length}: ${group.groupId}`);
-			const { results } = await env.DB.prepare('SELECT * FROM Messages WHERE groupId=? AND timeStamp >= ? ORDER BY timeStamp ASC')
-				.bind(group.groupId, Date.now() - 24 * 60 * 60 * 1000)
-				.all();
+		console.debug(`Processing group: ${groupId}`);
 
-			const result = await getGenModel(env).generateContent([
-				`用符合风格的语气概括下面的对话, 对话格式为
+		// 查询特定 groupId 的消息
+		const { results } = await env.DB.prepare(
+			`
+    SELECT * FROM Messages
+    WHERE groupId = ?
+    AND timeStamp >= ?
+    AND topicId = ?
+    ORDER BY timeStamp ASC
+`
+		)
+			.bind(
+				groupId,
+				Date.now() - 24 * 60 * 60 * 1000,
+				env.TOPIC_ID || null // 使用环境变量中的默认 topic
+			)
+			.all();
+
+		// 生成摘要
+		const result = await getGenModel(env).generateContent([
+			`用符合风格的语气概括下面的对话, 对话格式为
 ====================
 用户名:
 发言内容
@@ -239,41 +217,39 @@ export default {
 [引用2](链接本体)
 [关键字1](链接本体)
 [关键字2](链接本体)`,
-				`概括的开头是: 本日群聊总结如下：`,
-				...results.flatMap((r: any) => [`====================`, `${r.userName}:`, dispatchContent(r.content), getMessageLink(r)]),
-			]);
-			if ([-1001687785734].includes(parseInt(group.groupId as string))) {
-				// todo: use cloudflare r2 to store skip list
-				continue;
-			}
-			console.debug('send message to', group.groupId);
+			`概括的开头是: 本日群聊总结如下：`,
+			...results.flatMap((r: any) => [`====================`, `${r.userName}:`, dispatchContent(r.content), getMessageLink(r)]),
+		]);
 
-			// Use fetch to send message directly to Telegram API
-			const res = await fetch(`https://api.telegram.org/bot${env.SECRET_TELEGRAM_API_TOKEN}/sendMessage`, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify({
-					chat_id: group.groupId,
-					text: processMarkdownLinks(telegramifyMarkdown(messageTemplate(result.response.text()), 'keep')),
-					parse_mode: 'MarkdownV2',
-				}),
-			});
-		}
-		// clean up old images
+		// 发送摘要到 Telegram 群组
+		console.debug('send message to', groupId);
+		await fetch(`https://api.telegram.org/bot${env.SECRET_TELEGRAM_API_TOKEN}/sendMessage`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				chat_id: groupId,
+				message_thread_id: env.TOPIC_ID || undefined, // 添加 topic_id
+				text: processMarkdownLinks(telegramifyMarkdown(messageTemplate(result.response.text()), 'keep')),
+				parse_mode: 'MarkdownV2',
+			}),
+		});
+
+		// 清理旧图片
 		if (date.getHours() === 0 && date.getMinutes() < 5) {
 			ctx.waitUntil(
 				env.DB.prepare(
 					`
-					DELETE
-					FROM Messages
-					WHERE timeStamp < ? AND content LIKE 'data:image/jpeg;base64,%'`
+          DELETE
+          FROM Messages
+          WHERE timeStamp < ? AND content LIKE 'data:image/jpeg;base64,%'`
 				)
 					.bind(Date.now() - 24 * 60 * 60 * 1000)
 					.run()
 			);
 		}
+
 		console.debug('cron processed');
 	},
 	fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
@@ -319,94 +295,94 @@ ${results
 				}
 				return new Response('ok');
 			})
-			.on('ask', async (ctx) => {
-				const groupId = ctx.update.message!.chat.id;
-				const userId = ctx.update.message!.from!.id;
-				const messageText = ctx.update.message!.text || '';
-				if (!messageText.split(' ')[1]) {
-					const res = (await ctx.reply('请输入要问的问题'))!;
-					if (!res.ok) {
-						console.error(`Error sending message:`, res);
-					}
-					return new Response('ok');
-				}
-				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-					chat_id: userId,
-					parse_mode: 'MarkdownV2',
-					text: 'bot 已经收到你的问题, 请稍等',
-					reply_to_message_id: -1,
-				});
-				if (!res.ok) {
-					await ctx.reply(`请开启和 bot 的私聊, 不然无法接收消息`);
-					return new Response('ok');
-				}
-				const { results } = await env.DB.prepare(
-					`
-					WITH latest_1000 AS (
-						SELECT * FROM Messages
-						WHERE groupId=?
-						ORDER BY timeStamp DESC
-						LIMIT 1000
-					)
-					SELECT * FROM latest_1000
-					ORDER BY timeStamp ASC
-					`
-				)
-					.bind(groupId)
-					.all();
-				let result;
-				try {
-					result = await getGenModel(env).generateContent(
-						[
-							`下面是一系列的对话, 格式是
-====================
-用户名:
-发言内容
-相应链接
-====================
-`,
-							...results.flatMap((r: any) => [
-								`====================`,
-								`${r.userName as string}: `,
-								dispatchContent(r.content as string),
-								getSendTime(r),
-								getMessageLink(r),
-							]),
-							`基于上面的记录, 用符合上文风格的语气回答这个问题, 并在回答的关键词中用 markdown 的格式引用原对话的链接, 格式为
-[引用1](链接本体)
-[引用2](链接本体)
-[关键字1](链接本体)
-[关键字2](链接本体), 在链接的两侧加空格`,
-							getCommandVar(messageText, ' '),
-						],
-						{ timeout: 99999999999 }
-					);
-				} catch (e) {
-					console.error(e);
-					return new Response('ok');
-				}
-				let response_text: string;
-				if (result.response.promptFeedback?.blockReason) {
-					response_text = '无法回答, 理由' + result.response.promptFeedback.blockReason;
-				} else {
-					response_text = processMarkdownLinks(telegramifyMarkdown(result.response.text(), 'keep'));
-				}
-				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-					chat_id: userId,
-					parse_mode: 'MarkdownV2',
-					text: response_text,
-					reply_to_message_id: -1,
-				});
-				if (!res.ok) {
-					let reason = ((await res.json()) as any)?.promptFeedback?.blockReason;
-					if (reason) {
-						await ctx.reply(`无法回答, 理由 ${reason}`);
-						return new Response('ok');
-					}
-					await ctx.reply(`发送失败`);
-				}
-				return new Response('ok');
-			})
+			// 			.on('ask', async (ctx) => {
+			// 				const groupId = ctx.update.message!.chat.id;
+			// 				const userId = ctx.update.message!.from!.id;
+			// 				const messageText = ctx.update.message!.text || '';
+			// 				if (!messageText.split(' ')[1]) {
+			// 					const res = (await ctx.reply('请输入要问的问题'))!;
+			// 					if (!res.ok) {
+			// 						console.error(`Error sending message:`, res);
+			// 					}
+			// 					return new Response('ok');
+			// 				}
+			// 				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
+			// 					chat_id: userId,
+			// 					parse_mode: 'MarkdownV2',
+			// 					text: 'bot 已经收到你的问题, 请稍等',
+			// 					reply_to_message_id: -1,
+			// 				});
+			// 				if (!res.ok) {
+			// 					await ctx.reply(`请开启和 bot 的私聊, 不然无法接收消息`);
+			// 					return new Response('ok');
+			// 				}
+			// 				const { results } = await env.DB.prepare(
+			// 					`
+			// 					WITH latest_1000 AS (
+			// 						SELECT * FROM Messages
+			// 						WHERE groupId=?
+			// 						ORDER BY timeStamp DESC
+			// 						LIMIT 1000
+			// 					)
+			// 					SELECT * FROM latest_1000
+			// 					ORDER BY timeStamp ASC
+			// 					`
+			// 				)
+			// 					.bind(groupId)
+			// 					.all();
+			// 				let result;
+			// 				try {
+			// 					result = await getGenModel(env).generateContent(
+			// 						[
+			// 							`下面是一系列的对话, 格式是
+			// ====================
+			// 用户名:
+			// 发言内容
+			// 相应链接
+			// ====================
+			// `,
+			// 							...results.flatMap((r: any) => [
+			// 								`====================`,
+			// 								`${r.userName as string}: `,
+			// 								dispatchContent(r.content as string),
+			// 								getSendTime(r),
+			// 								getMessageLink(r),
+			// 							]),
+			// 							`基于上面的记录, 用符合上文风格的语气回答这个问题, 并在回答的关键词中用 markdown 的格式引用原对话的链接, 格式为
+			// [引用1](链接本体)
+			// [引用2](链接本体)
+			// [关键字1](链接本体)
+			// [关键字2](链接本体), 在链接的两侧加空格`,
+			// 							getCommandVar(messageText, ' '),
+			// 						],
+			// 						{ timeout: 99999999999 }
+			// 					);
+			// 				} catch (e) {
+			// 					console.error(e);
+			// 					return new Response('ok');
+			// 				}
+			// 				let response_text: string;
+			// 				if (result.response.promptFeedback?.blockReason) {
+			// 					response_text = '无法回答, 理由' + result.response.promptFeedback.blockReason;
+			// 				} else {
+			// 					response_text = processMarkdownLinks(telegramifyMarkdown(result.response.text(), 'keep'));
+			// 				}
+			// 				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
+			// 					chat_id: userId,
+			// 					parse_mode: 'MarkdownV2',
+			// 					text: response_text,
+			// 					reply_to_message_id: -1,
+			// 				});
+			// 				if (!res.ok) {
+			// 					let reason = ((await res.json()) as any)?.promptFeedback?.blockReason;
+			// 					if (reason) {
+			// 						await ctx.reply(`无法回答, 理由 ${reason}`);
+			// 						return new Response('ok');
+			// 					}
+			// 					await ctx.reply(`发送失败`);
+			// 				}
+			// 				return new Response('ok');
+			// 			})
 			.on('summary', async (bot) => {
 				const groupId = bot.update.message!.chat.id;
 				if (bot.update.message!.text!.split(' ').length === 1) {
@@ -496,6 +472,7 @@ ${results
 					case 'message': {
 						const msg = bot.update.message!;
 						const groupId = msg.chat.id;
+						const topicId = msg.reply_to_message?.message_id || null; // 获取 topic id
 						let content = msg.text || '';
 						const fwd = msg.forward_from?.last_name;
 						const replyTo = msg.reply_to_message?.message_id;
@@ -503,7 +480,7 @@ ${results
 							content = `转发自 ${fwd}: ${content}`;
 						}
 						if (replyTo) {
-							content = `回复 ${getMessageLink({ groupId: groupId.toString(), messageId: replyTo })}: ${content}`;
+							content = `回复 ${getMessageLink({ groupId: groupId.toString(), messageId: replyTo, topicId })}: ${content}`;
 						}
 						if (content.startsWith('http') && !content.includes(' ')) {
 							content = await extractAllOGInfo(content);
@@ -515,16 +492,17 @@ ${results
 						try {
 							await env.DB.prepare(
 								`
-								INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`
+								INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 							)
 								.bind(
-									getMessageLink({ groupId: groupId.toString(), messageId }),
+									getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
 									groupId,
 									timeStamp,
 									userName, // not interested in user id
 									content,
 									messageId,
-									groupName
+									groupName,
+									topicId
 								)
 								.run();
 						} catch (e) {
@@ -537,6 +515,7 @@ ${results
 						const groupId = msg.chat.id;
 						const messageId = msg.message_id;
 						const groupName = msg.chat.title || 'anonymous';
+						const topicId = msg.reply_to_message?.message_id || null; // 获取 topic id
 						const timeStamp = Date.now();
 						const userName = getUserName(msg);
 						const photo = msg.photo![msg.photo!.length - 1];
@@ -548,16 +527,17 @@ ${results
 						try {
 							await env.DB.prepare(
 								`
-							INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`
+							INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 							)
 								.bind(
-									getMessageLink({ groupId: groupId.toString(), messageId }),
+									getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
 									groupId,
 									timeStamp,
 									userName, // not interested in user id
 									'data:image/jpeg;base64,' + Buffer.from(file).toString('base64'),
 									messageId,
-									groupName
+									groupName,
+									topicId
 								)
 								.run();
 						} catch (e) {
@@ -574,21 +554,23 @@ ${results
 				const content = msg.text || '';
 				const messageId = msg.message_id;
 				const groupName = msg.chat.title || 'anonymous';
+				const topicId = msg.reply_to_message?.message_id || null; // 获取 topic id
 				const timeStamp = Date.now();
 				const userName = getUserName(msg);
 				try {
 					await env.DB.prepare(
 						`
-					INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`
+					INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, topicId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 					)
 						.bind(
-							getMessageLink({ groupId: groupId.toString(), messageId }),
+							getMessageLink({ groupId: groupId.toString(), messageId, topicId }),
 							groupId,
 							timeStamp,
 							userName, // not interested in user id
 							content,
 							messageId,
-							groupName
+							groupName,
+							topicId
 						)
 						.run();
 				} catch (e) {
