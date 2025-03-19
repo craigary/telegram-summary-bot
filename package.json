@@ -1,28 +1,28 @@
 {
-  "name": "telegram-summary-bot",
-  "version": "0.0.0",
-  "private": true,
-  "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "start": "wrangler dev",
-    "test": "vitest",
-    "cf-typegen": "wrangler types"
-  },
-  "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.5.2",
-    "@cloudflare/workers-types": "^4.20241112.0",
-    "typescript": "^5.5.2",
-    "vitest": "2.0.5",
-    "wrangler": "^3.60.3"
-  },
-  "dependencies": {
-    "@codebam/cf-workers-telegram-bot": "^7.27.0",
-    "@google/generative-ai": "^0.21.0",
-    "openai": "^4.75.0",
-    "telegramify-markdown": "^1.2.2"
-  },
-  "overrides": {
-    "is-core-module": "npm:@nolyfill/is-core-module@^1"
-  }
+	"name": "telegram-summary-bot",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "vitest",
+		"cf-typegen": "wrangler types"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.5.2",
+		"@cloudflare/workers-types": "^4.20241112.0",
+		"typescript": "^5.5.2",
+		"vitest": "2.0.5",
+		"wrangler": "^3.60.3"
+	},
+	"dependencies": {
+		"@codebam/cf-workers-telegram-bot": "^9.1.1",
+		"@google/generative-ai": "^0.21.0",
+		"openai": "^4.75.0",
+		"telegramify-markdown": "^1.2.2"
+	},
+	"overrides": {
+		"is-core-module": "npm:@nolyfill/is-core-module@^1"
+	}
 }
